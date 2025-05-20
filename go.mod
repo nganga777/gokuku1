@@ -1,4 +1,4 @@
-module github.com/yourusername/email-service
+module github.com/nganga777/gokuku
 
 go 1.20
 
