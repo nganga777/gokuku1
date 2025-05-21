@@ -34,7 +34,7 @@ type SMTPConfig struct {
 type ProxyConfig struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
-	Username string `json:"username,omitempty"
+	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 }
 
@@ -60,7 +60,6 @@ func main() {
 	r := mux.NewRouter()
 	r.HandleFunc("/send-email", sendEmailHandler).Methods("POST")
 
-	// Add middleware for request logging
 	r.Use(loggingMiddleware)
 
 	srv := &http.Server{
@@ -74,13 +73,11 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-// Middleware to log incoming requests
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		log.Printf("Started %s %s", r.Method, r.URL.Path)
 		
-		// Create a response writer wrapper to capture status code
 		rw := &responseWriter{w, http.StatusOK}
 		next.ServeHTTP(rw, r)
 		
@@ -111,13 +108,11 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Println("Successfully decoded request body")
 
-	// Initialize logging entry
 	logEntry := createLogEntry(req, r)
 	messageID := fmt.Sprintf("<%s@%s>", generateUUID(), req.SMTPConfig.Host)
 	logEntry["messageId"] = messageID
 	log.Printf("Created message ID: %s", messageID)
 
-	// Process proxy - skip verification since we know it works for SMTP
 	proxyUsed := req.ProxyConfig != nil && req.ProxyConfig.Host != ""
 	if proxyUsed {
 		logEntry["proxyUsed"] = true
@@ -128,11 +123,9 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		log.Println("No proxy configured, using direct connection")
 	}
 
-	// Log SMTP config (without password)
 	log.Printf("SMTP Config - Host: %s, Port: %d, Secure: %t, User: %s", 
 		req.SMTPConfig.Host, req.SMTPConfig.Port, req.SMTPConfig.Secure, req.SMTPConfig.Auth.User)
 
-	// Send email
 	log.Println("Attempting to send email...")
 	err := sendEmail(req, logEntry, proxyUsed)
 	if err != nil {
@@ -151,7 +144,6 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Success response
 	log.Println("Email sent successfully")
 	logEntry["finalOutcome"] = "success"
 	logEntry["smtpSuccess"] = true
@@ -229,19 +221,16 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 	}
 	defer conn.Close()
 
-	// Create client with longer timeout
 	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
 	if err != nil {
 		return fmt.Errorf("failed to create SMTP client: %v", err)
 	}
 	defer client.Close()
 
-	// Send initial EHLO
 	if err := client.Hello("localhost"); err != nil {
 		return fmt.Errorf("initial EHLO failed: %v", err)
 	}
 
-	// Handle STARTTLS for port 587
 	if req.SMTPConfig.Port == 587 {
 		if ok, _ := client.Extension("STARTTLS"); ok {
 			log.Println("Server supports STARTTLS, attempting upgrade")
@@ -259,12 +248,10 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 		}
 	}
 
-	// Authenticate
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("SMTP authentication failed: %v", err)
 	}
 
-	// Set sender and recipient
 	from := mail.Address{Name: req.SenderName, Address: req.SenderEmail}
 	to := mail.Address{Address: req.ToEmail}
 	if err := client.Mail(from.Address); err != nil {
@@ -274,7 +261,6 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 		return fmt.Errorf("RCPT TO failed: %v", err)
 	}
 
-	// Send email body
 	w, err := client.Data()
 	if err != nil {
 		return fmt.Errorf("DATA command failed: %v", err)
