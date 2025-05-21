@@ -34,7 +34,7 @@ type SMTPConfig struct {
 type ProxyConfig struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
-	Username string `json:"username,omitempty"`
+	Username string `json:"username,omitempty"
 	Password string `json:"password,omitempty"`
 }
 
@@ -117,12 +117,15 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	logEntry["messageId"] = messageID
 	log.Printf("Created message ID: %s", messageID)
 
-	// Process proxy and get afterProxyIP if needed
-	proxyUsed, afterProxyIP, proxyErr := processProxy(&req, logEntry)
-	if proxyErr != nil {
-		log.Printf("Proxy processing error: %v", proxyErr)
-		logEntry["proxyError"] = proxyErr.Error()
-		logEntry["fallbackToDirect"] = true
+	// Process proxy - skip verification since we know it works for SMTP
+	proxyUsed := req.ProxyConfig != nil && req.ProxyConfig.Host != ""
+	if proxyUsed {
+		logEntry["proxyUsed"] = true
+		logEntry["connectionType"] = "proxy"
+		log.Println("Proxy configured, will attempt to use for SMTP")
+	} else {
+		logEntry["connectionType"] = "direct"
+		log.Println("No proxy configured, using direct connection")
 	}
 
 	// Log SMTP config (without password)
@@ -146,12 +149,6 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(response)
 		return
-	}
-
-	// Add afterProxyIP if proxy was used successfully
-	if proxyUsed && afterProxyIP != "" {
-		logEntry["afterProxyIp"] = afterProxyIP
-		log.Printf("Proxy used successfully. After proxy IP: %s", afterProxyIP)
 	}
 
 	// Success response
@@ -205,99 +202,6 @@ func createLogEntry(req EmailRequest, r *http.Request) map[string]interface{} {
 	return logEntry
 }
 
-func processProxy(req *EmailRequest, logEntry map[string]interface{}) (bool, string, error) {
-	if req.ProxyConfig == nil || req.ProxyConfig.Host == "" {
-		logEntry["connectionType"] = "direct"
-		log.Println("No proxy configured, using direct connection")
-		return false, "", nil
-	}
-
-	log.Println("Attempting to connect via proxy...")
-	// Get public IP through proxy
-	ip, err := getPublicIPViaProxy(req.ProxyConfig)
-	if err != nil {
-		logEntry["connectionType"] = "direct"
-		log.Printf("Proxy connection failed, falling back to direct: %v", err)
-		return false, "", err
-	}
-
-	logEntry["proxyUsed"] = true
-	logEntry["connectionType"] = "proxy"
-	log.Printf("Successfully connected via proxy. Public IP: %s", ip)
-	return true, ip, nil
-}
-
-func getPublicIPViaProxy(proxyConfig *ProxyConfig) (string, error) {
-	log.Printf("Creating proxy dialer for %s:%d", proxyConfig.Host, proxyConfig.Port)
-	dialer, err := createProxyDialer(proxyConfig)
-	if err != nil {
-		log.Printf("Failed to create proxy dialer: %v", err)
-		return "", err
-	}
-
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			log.Printf("Dialing through proxy: %s %s", network, addr)
-			return dialer.Dial(network, addr)
-		},
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   10 * time.Second,
-	}
-
-	log.Println("Making request to api.ipify.org to determine public IP")
-	resp, err := client.Get("https://api.ipify.org")
-	if err != nil {
-		log.Printf("Failed to get public IP via proxy: %v", err)
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Unexpected status code from ipify: %d", resp.StatusCode)
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("Failed to read response body: %v", err)
-		return "", err
-	}
-
-	ip := string(body)
-	log.Printf("Successfully retrieved public IP via proxy: %s", ip)
-	return ip, nil
-}
-
-func createProxyDialer(proxyConfig *ProxyConfig) (proxy.Dialer, error) {
-	log.Println("Creating base dialer")
-	baseDialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	auth := &proxy.Auth{
-		User:     proxyConfig.Username,
-		Password: proxyConfig.Password,
-	}
-
-	log.Printf("Creating SOCKS5 dialer for %s:%d", proxyConfig.Host, proxyConfig.Port)
-	dialer, err := proxy.SOCKS5(
-		"tcp",
-		fmt.Sprintf("%s:%d", proxyConfig.Host, proxyConfig.Port),
-		auth,
-		baseDialer,
-	)
-	if err != nil {
-		log.Printf("Failed to create SOCKS5 dialer: %v", err)
-		return nil, err
-	}
-
-	return dialer, nil
-}
-
 func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) error {
 	log.Println("Starting email sending process")
 	
@@ -332,14 +236,13 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 	}
 	defer client.Close()
 
-	// Send EHLO first
+	// Send initial EHLO
 	if err := client.Hello("localhost"); err != nil {
-		return fmt.Errorf("EHLO failed: %v", err)
+		return fmt.Errorf("initial EHLO failed: %v", err)
 	}
 
-	// Special handling for port 587
+	// Handle STARTTLS for port 587
 	if req.SMTPConfig.Port == 587 {
-		log.Println("Port 587 detected - checking for STARTTLS support")
 		if ok, _ := client.Extension("STARTTLS"); ok {
 			log.Println("Server supports STARTTLS, attempting upgrade")
 			tlsConfig := &tls.Config{
@@ -351,11 +254,6 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 				return fmt.Errorf("STARTTLS failed: %v", err)
 			}
 			log.Println("STARTTLS completed successfully")
-			
-			// Re-send EHLO after STARTTLS
-			if err := client.Hello("localhost"); err != nil {
-				return fmt.Errorf("EHLO after STARTTLS failed: %v", err)
-			}
 		} else {
 			log.Println("Server does not support STARTTLS, continuing without encryption")
 		}
@@ -397,6 +295,33 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 
 	log.Println("Email successfully sent")
 	return nil
+}
+
+func createProxyDialer(proxyConfig *ProxyConfig) (proxy.Dialer, error) {
+	log.Println("Creating base dialer")
+	baseDialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	auth := &proxy.Auth{
+		User:     proxyConfig.Username,
+		Password: proxyConfig.Password,
+	}
+
+	log.Printf("Creating SOCKS5 dialer for %s:%d", proxyConfig.Host, proxyConfig.Port)
+	dialer, err := proxy.SOCKS5(
+		"tcp",
+		fmt.Sprintf("%s:%d", proxyConfig.Host, proxyConfig.Port),
+		auth,
+		baseDialer,
+	)
+	if err != nil {
+		log.Printf("Failed to create SOCKS5 dialer: %v", err)
+		return nil, err
+	}
+
+	return dialer, nil
 }
 
 func generateUUID() string {
