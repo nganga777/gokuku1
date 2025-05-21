@@ -314,21 +314,70 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 			log.Printf("Failed to create proxy dialer for SMTP: %v", err)
 			return fmt.Errorf("proxy connection failed: %v", err)
 		}
-	} else {
-		log.Println("Using direct connection for SMTP")
 	}
 
-	// Verify connection
-	log.Println("Verifying SMTP connection")
-	if err := verifySMTPConnection(req, dialer, logs); err != nil {
-		log.Printf("SMTP connection verification failed: %v", err)
-		return err
+	addr := fmt.Sprintf("%s:%d", req.SMTPConfig.Host, req.SMTPConfig.Port)
+	auth := smtp.PlainAuth("", req.SMTPConfig.Auth.User, req.SMTPConfig.Auth.Password, req.SMTPConfig.Host)
+
+	log.Printf("Dialing SMTP server at %s", addr)
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to dial SMTP server: %v", err)
+	}
+	defer conn.Close()
+
+	// Create client with longer timeout
+	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
+	if err != nil {
+		return fmt.Errorf("failed to create SMTP client: %v", err)
+	}
+	defer client.Close()
+
+	// Send EHLO first
+	if err := client.Hello("localhost"); err != nil {
+		return fmt.Errorf("EHLO failed: %v", err)
 	}
 
-	// Create message
-	log.Println("Creating email message")
+	// Handle STARTTLS for port 587
+	if req.SMTPConfig.Port == 587 {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			log.Println("Starting STARTTLS")
+			tlsConfig := &tls.Config{
+				ServerName:         req.SMTPConfig.Host,
+				InsecureSkipVerify: false,
+				MinVersion:         tls.VersionTLS12,
+			}
+			if err := client.StartTLS(tlsConfig); err != nil {
+				return fmt.Errorf("STARTTLS failed: %v", err)
+			}
+			// Re-send EHLO after STARTTLS
+			if err := client.Hello("localhost"); err != nil {
+				return fmt.Errorf("EHLO after STARTTLS failed: %v", err)
+			}
+		}
+	}
+
+	// Authenticate
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("SMTP authentication failed: %v", err)
+	}
+
+	// Set sender and recipient
 	from := mail.Address{Name: req.SenderName, Address: req.SenderEmail}
 	to := mail.Address{Address: req.ToEmail}
+	if err := client.Mail(from.Address); err != nil {
+		return fmt.Errorf("MAIL FROM failed: %v", err)
+	}
+	if err := client.Rcpt(to.Address); err != nil {
+		return fmt.Errorf("RCPT TO failed: %v", err)
+	}
+
+	// Send email body
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("DATA command failed: %v", err)
+	}
+	defer w.Close()
 
 	var msg bytes.Buffer
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from.String()))
@@ -338,109 +387,10 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 	msg.WriteString("\r\n")
 	msg.WriteString(fmt.Sprintf("<p>Your verification code is: <strong>%s</strong></p>", req.Code))
 
-	// Connect and send
-	addr := fmt.Sprintf("%s:%d", req.SMTPConfig.Host, req.SMTPConfig.Port)
-	auth := smtp.PlainAuth("", req.SMTPConfig.Auth.User, req.SMTPConfig.Auth.Password, req.SMTPConfig.Host)
-
-	log.Printf("Dialing SMTP server at %s", addr)
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		log.Printf("Failed to dial SMTP server: %v", err)
-		return err
-	}
-	defer conn.Close()
-	log.Println("Successfully connected to SMTP server")
-
-	log.Println("Creating SMTP client")
-	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
-	if err != nil {
-		log.Printf("Failed to create SMTP client: %v", err)
-		return err
-	}
-	defer client.Close()
-	log.Println("SMTP client created successfully")
-
-	if req.SMTPConfig.Secure {
-		log.Println("Starting TLS")
-		if err = client.StartTLS(&tls.Config{ServerName: req.SMTPConfig.Host}); err != nil {
-			log.Printf("StartTLS failed: %v", err)
-			return err
-		}
-		log.Println("TLS established successfully")
+	if _, err := msg.WriteTo(w); err != nil {
+		return fmt.Errorf("failed to write email body: %v", err)
 	}
 
-	log.Println("Authenticating with SMTP server")
-	if err = client.Auth(auth); err != nil {
-		log.Printf("SMTP authentication failed: %v", err)
-		return err
-	}
-	log.Println("Authentication successful")
-
-	log.Printf("Setting sender: %s", from.Address)
-	if err = client.Mail(from.Address); err != nil {
-		log.Printf("MAIL FROM command failed: %v", err)
-		return err
-	}
-
-	log.Printf("Setting recipient: %s", to.Address)
-	if err = client.Rcpt(to.Address); err != nil {
-		log.Printf("RCPT TO command failed: %v", err)
-		return err
-	}
-
-	log.Println("Preparing to send email data")
-	w, err := client.Data()
-	if err != nil {
-		log.Printf("DATA command failed: %v", err)
-		return err
-	}
-	defer w.Close()
-
-	log.Println("Writing email content")
-	_, err = msg.WriteTo(w)
-	if err != nil {
-		log.Printf("Failed to write email content: %v", err)
-		return err
-	}
-	log.Println("Email content written successfully")
-
-	return nil
-}
-
-func verifySMTPConnection(req EmailRequest, dialer proxy.Dialer, logs map[string]interface{}) error {
-	addr := fmt.Sprintf("%s:%d", req.SMTPConfig.Host, req.SMTPConfig.Port)
-	log.Printf("Verifying SMTP connection to %s", addr)
-	
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		log.Printf("SMTP connection verification failed at dial: %v", err)
-		logs["connectionVerified"] = false
-		logs["verifyError"] = err.Error()
-		return fmt.Errorf("connection failed: %v", err)
-	}
-	defer conn.Close()
-	log.Println("SMTP connection established for verification")
-
-	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
-	if err != nil {
-		log.Printf("SMTP client creation failed during verification: %v", err)
-		logs["connectionVerified"] = false
-		logs["verifyError"] = err.Error()
-		return fmt.Errorf("SMTP client creation failed: %v", err)
-	}
-	defer client.Close()
-	log.Println("SMTP client created for verification")
-
-	log.Println("Sending NOOP command to verify connection")
-	if err := client.Noop(); err != nil {
-		log.Printf("SMTP NOOP command failed: %v", err)
-		logs["connectionVerified"] = false
-		logs["verifyError"] = err.Error()
-		return fmt.Errorf("SMTP noop failed: %v", err)
-	}
-
-	logs["connectionVerified"] = true
-	log.Println("SMTP connection verified successfully")
 	return nil
 }
 
