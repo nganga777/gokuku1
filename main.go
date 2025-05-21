@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -111,11 +113,21 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	logEntry["messageId"] = messageID
 	log.Printf("Created message ID: %s", messageID)
 
+	var afterProxyIP string
 	proxyUsed := req.ProxyConfig != nil && req.ProxyConfig.Host != ""
 	if proxyUsed {
 		logEntry["proxyUsed"] = true
 		logEntry["connectionType"] = "proxy"
 		log.Println("Proxy configured, will attempt to use for SMTP")
+		
+		// Get the proxy IP if possible
+		if ip, err := getPublicIPViaProxy(req.ProxyConfig); err == nil {
+			afterProxyIP = ip
+			logEntry["afterProxyIp"] = afterProxyIP
+			log.Printf("Proxy IP detected: %s", afterProxyIP)
+		} else {
+			log.Printf("Could not detect proxy IP: %v", err)
+		}
 	} else {
 		logEntry["connectionType"] = "direct"
 		log.Println("No proxy configured, using direct connection")
@@ -152,6 +164,41 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func getPublicIPViaProxy(proxyConfig *ProxyConfig) (string, error) {
+	dialer, err := createProxyDialer(proxyConfig)
+	if err != nil {
+		return "", err
+	}
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		},
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+
+	resp, err := client.Get("https://api.ipify.org")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), nil
 }
 
 func createLogEntry(req EmailRequest, r *http.Request) map[string]interface{} {
