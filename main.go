@@ -80,8 +80,8 @@ const (
 	maxRetries        = 3
 	initialRetryDelay = 2 * time.Second
 	smtpDialTimeout   = 15 * time.Second
-	smtpCmdTimeout   = 10 * time.Second
-	smtpDataTimeout  = 15 * time.Second
+	smtpCmdTimeout    = 10 * time.Second
+	smtpDataTimeout   = 15 * time.Second
 )
 
 func main() {
@@ -226,16 +226,16 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 	addr := fmt.Sprintf("%s:%d", req.SMTPConfig.Host, req.SMTPConfig.Port)
 	auth := smtp.PlainAuth("", req.SMTPConfig.Auth.User, req.SMTPConfig.Auth.Password, req.SMTPConfig.Host)
 
-	ctx, cancel := context.WithTimeout(context.Background(), smtpDialTimeout)
-	defer cancel()
-
-	conn, err := dialer.(interface {
-		DialContext(ctx context.Context, network, addr string) (net.Conn, error)
-	}).DialContext(ctx, "tcp", addr)
+	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to dial SMTP server: %v", err)
 	}
 	defer conn.Close()
+
+	// Set initial connection deadline
+	if err := conn.SetDeadline(time.Now().Add(smtpDialTimeout)); err != nil {
+		return fmt.Errorf("failed to set connection deadline: %v", err)
+	}
 
 	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
 	if err != nil {
@@ -247,8 +247,9 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		}
 	}()
 
-	if err := clientSetDeadline(client, smtpCmdTimeout); err != nil {
-		return err
+	// Reset deadline for initial handshake
+	if err := conn.SetDeadline(time.Now().Add(smtpCmdTimeout)); err != nil {
+		return fmt.Errorf("failed to set handshake deadline: %v", err)
 	}
 	if err := client.Hello("localhost"); err != nil {
 		return fmt.Errorf("initial EHLO failed: %v", err)
@@ -267,15 +268,17 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		}
 	}
 
-	if err := clientSetDeadline(client, smtpCmdTimeout); err != nil {
-		return err
+	// Set deadline for authentication
+	if err := conn.SetDeadline(time.Now().Add(smtpCmdTimeout)); err != nil {
+		return fmt.Errorf("failed to set auth deadline: %v", err)
 	}
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("SMTP authentication failed: %v", err)
 	}
 
-	if err := clientSetDeadline(client, smtpCmdTimeout); err != nil {
-		return err
+	// Set deadline for MAIL/RCPT commands
+	if err := conn.SetDeadline(time.Now().Add(smtpCmdTimeout)); err != nil {
+		return fmt.Errorf("failed to set command deadline: %v", err)
 	}
 	from := mail.Address{Name: req.SenderName, Address: req.SenderEmail}
 	to := mail.Address{Address: req.ToEmail}
@@ -286,8 +289,9 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		return fmt.Errorf("RCPT TO failed: %v", err)
 	}
 
-	if err := clientSetDeadline(client, smtpDataTimeout); err != nil {
-		return err
+	// Set deadline for DATA command
+	if err := conn.SetDeadline(time.Now().Add(smtpDataTimeout)); err != nil {
+		return fmt.Errorf("failed to set data deadline: %v", err)
 	}
 	wc, err := client.Data()
 	if err != nil {
@@ -309,10 +313,6 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 
 	log.Println("Email successfully sent")
 	return nil
-}
-
-func clientSetDeadline(client *smtp.Client, timeout time.Duration) error {
-	return client.SetDeadline(time.Now().Add(timeout))
 }
 
 func createProxyDialer(proxyConfig *ProxyConfig) (proxy.Dialer, error) {
