@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/smtp"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -56,17 +57,35 @@ type EmailResponse struct {
 	Logs      map[string]interface{} `json:"logs"`
 }
 
+var (
+	connectionPool = sync.Pool{
+		New: func() interface{} {
+			return &net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 0, // Disable keep-alive
+			}
+		},
+	}
+	proxyDialerPool = sync.Pool{
+		New: func() interface{} {
+			return &struct {
+				dialer proxy.Dialer
+				mu     sync.Mutex
+			}{}
+		},
+	}
+)
+
 func main() {
 	r := mux.NewRouter()
 	r.HandleFunc("/send-email", sendEmailHandler).Methods("POST")
-
 	r.Use(loggingMiddleware)
 
 	srv := &http.Server{
 		Handler:      r,
 		Addr:         ":3000",
-		WriteTimeout: 15 * time.Second,
-		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  30 * time.Second,
 	}
 
 	log.Println("Server started on :3000")
@@ -106,38 +125,27 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	log.Println("Successfully decoded request body")
 
 	logEntry := createLogEntry(req, r)
 	messageID := fmt.Sprintf("<%s@%s>", generateUUID(), req.SMTPConfig.Host)
 	logEntry["messageId"] = messageID
-	log.Printf("Created message ID: %s", messageID)
 
-	var afterProxyIP string
+	// Non-blocking proxy IP detection
 	proxyUsed := req.ProxyConfig != nil && req.ProxyConfig.Host != ""
 	if proxyUsed {
 		logEntry["proxyUsed"] = true
-		logEntry["connectionType"] = "proxy"
-		log.Println("Proxy configured, will attempt to use for SMTP")
-		
-		// Try to get proxy IP (but don't fail if we can't)
-		if ip, err := getProxyIP(req.ProxyConfig); err == nil {
-			afterProxyIP = ip
-			logEntry["afterProxyIp"] = afterProxyIP
-			log.Printf("Detected proxy IP: %s", afterProxyIP)
-		} else {
-			log.Printf("Could not detect proxy IP: %v", err)
-		}
-	} else {
-		logEntry["connectionType"] = "direct"
-		log.Println("No proxy configured, using direct connection")
+		go func() {
+			if ip, err := getProxyIP(req.ProxyConfig); err == nil {
+				logEntry["afterProxyIp"] = ip
+				log.Printf("Proxy IP detected: %s", ip)
+			} else {
+				log.Printf("Proxy IP detection failed (non-critical): %v", err)
+			}
+		}()
 	}
 
-	log.Printf("SMTP Config - Host: %s, Port: %d, Secure: %t, User: %s", 
-		req.SMTPConfig.Host, req.SMTPConfig.Port, req.SMTPConfig.Secure, req.SMTPConfig.Auth.User)
-
-	log.Println("Attempting to send email...")
-	err := sendEmail(req, logEntry, proxyUsed)
+	// Isolated email sending
+	err := sendEmailWithIsolation(req, logEntry, proxyUsed)
 	if err != nil {
 		log.Printf("Email sending failed: %v", err)
 		response := EmailResponse{
@@ -145,18 +153,12 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 			Error:   err.Error(),
 			Logs:    logEntry,
 		}
-		logEntry["finalOutcome"] = "error"
-		logEntry["smtpSuccess"] = false
-		logEntry["smtpError"] = err.Error()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(response)
 		return
 	}
 
-	log.Println("Email sent successfully")
-	logEntry["finalOutcome"] = "success"
-	logEntry["smtpSuccess"] = true
 	response := EmailResponse{
 		Success:   true,
 		MessageID: messageID,
@@ -166,111 +168,63 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func getProxyIP(proxyConfig *ProxyConfig) (string, error) {
-	dialer, err := createProxyDialer(proxyConfig)
-	if err != nil {
-		return "", fmt.Errorf("failed to create proxy dialer: %v", err)
-	}
-
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.Dial(network, addr)
-		},
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   5 * time.Second,
-	}
-
-	resp, err := client.Get("https://api.ipify.org")
-	if err != nil {
-		return "", fmt.Errorf("failed to get IP: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	ip, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %v", err)
-	}
-
-	return string(ip), nil
-}
-
-func createLogEntry(req EmailRequest, r *http.Request) map[string]interface{} {
-	clientIP := r.RemoteAddr
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		clientIP = forwarded
-	}
-
-	logEntry := map[string]interface{}{
-		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-		"originalIp": func() string {
-			if req.OriginalIP != "" {
-				return req.OriginalIP
-			}
-			return clientIP
-		}(),
-		"beforeProxyIp": clientIP,
-		"requestData": map[string]string{
-			"toEmail":     req.ToEmail,
-			"senderEmail": req.SenderEmail,
-			"subject":     req.Subject,
-		},
-	}
-
-	if req.ProxyConfig != nil {
-		logEntry["proxyConfig"] = map[string]interface{}{
-			"host":    req.ProxyConfig.Host,
-			"port":    req.ProxyConfig.Port,
-			"hasAuth": req.ProxyConfig.Username != "",
-		}
-		log.Printf("Proxy config present - Host: %s, Port: %d", 
-			req.ProxyConfig.Host, req.ProxyConfig.Port)
-	} else {
-		logEntry["noProxyConfigured"] = true
-		log.Println("No proxy configuration provided")
-	}
-
-	return logEntry
-}
-
-func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) error {
-	log.Println("Starting email sending process")
+func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, useProxy bool) error {
+	log.Println("Starting isolated email sending process")
 	
-	var dialer proxy.Dialer = &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
+	// Get a dialer from the pool
+	baseDialer := connectionPool.Get().(*net.Dialer)
+	defer connectionPool.Put(baseDialer)
+
+	var dialer proxy.Dialer = baseDialer
 
 	if useProxy && req.ProxyConfig != nil {
-		log.Println("Using proxy for SMTP connection")
+		proxyDialerWrapper := proxyDialerPool.Get().(*struct {
+			dialer proxy.Dialer
+			mu     sync.Mutex
+		})
+		defer proxyDialerPool.Put(proxyDialerWrapper)
+
+		proxyDialerWrapper.mu.Lock()
+		defer proxyDialerWrapper.mu.Unlock()
+
 		var err error
-		dialer, err = createProxyDialer(req.ProxyConfig)
+		if proxyDialerWrapper.dialer == nil {
+			proxyDialerWrapper.dialer, err = proxy.SOCKS5(
+				"tcp",
+				fmt.Sprintf("%s:%d", req.ProxyConfig.Host, req.ProxyConfig.Port),
+				&proxy.Auth{
+					User:     req.ProxyConfig.Username,
+					Password: req.ProxyConfig.Password,
+				},
+				baseDialer,
+			)
+		}
 		if err != nil {
 			return fmt.Errorf("proxy connection failed: %v", err)
 		}
+		dialer = proxyDialerWrapper.dialer
 	}
 
 	addr := fmt.Sprintf("%s:%d", req.SMTPConfig.Host, req.SMTPConfig.Port)
 	auth := smtp.PlainAuth("", req.SMTPConfig.Auth.User, req.SMTPConfig.Auth.Password, req.SMTPConfig.Host)
 
-	log.Printf("Dialing SMTP server at %s", addr)
+	// Create isolated connection
 	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to dial SMTP server: %v", err)
 	}
 	defer conn.Close()
 
+	// Create new client for each request
 	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
 	if err != nil {
 		return fmt.Errorf("failed to create SMTP client: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Quit(); err != nil {
+			log.Printf("Error closing SMTP client: %v", err)
+		}
+	}()
 
 	if err := client.Hello("localhost"); err != nil {
 		return fmt.Errorf("initial EHLO failed: %v", err)
@@ -278,7 +232,6 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 
 	if req.SMTPConfig.Port == 587 {
 		if ok, _ := client.Extension("STARTTLS"); ok {
-			log.Println("Server supports STARTTLS, attempting upgrade")
 			tlsConfig := &tls.Config{
 				ServerName:         req.SMTPConfig.Host,
 				InsecureSkipVerify: false,
@@ -287,9 +240,6 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 			if err := client.StartTLS(tlsConfig); err != nil {
 				return fmt.Errorf("STARTTLS failed: %v", err)
 			}
-			log.Println("STARTTLS completed successfully")
-		} else {
-			log.Println("Server does not support STARTTLS, continuing without encryption")
 		}
 	}
 
@@ -306,11 +256,11 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 		return fmt.Errorf("RCPT TO failed: %v", err)
 	}
 
-	w, err := client.Data()
+	wc, err := client.Data()
 	if err != nil {
 		return fmt.Errorf("DATA command failed: %v", err)
 	}
-	defer w.Close()
+	defer wc.Close()
 
 	var msg bytes.Buffer
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from.String()))
@@ -320,7 +270,7 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 	msg.WriteString("\r\n")
 	msg.WriteString(fmt.Sprintf("<p>Your verification code is: <strong>%s</strong></p>", req.Code))
 
-	if _, err := msg.WriteTo(w); err != nil {
+	if _, err := msg.WriteTo(wc); err != nil {
 		return fmt.Errorf("failed to write email body: %v", err)
 	}
 
@@ -328,31 +278,74 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 	return nil
 }
 
-func createProxyDialer(proxyConfig *ProxyConfig) (proxy.Dialer, error) {
-	log.Println("Creating base dialer")
-	baseDialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	auth := &proxy.Auth{
-		User:     proxyConfig.Username,
-		Password: proxyConfig.Password,
-	}
-
-	log.Printf("Creating SOCKS5 dialer for %s:%d", proxyConfig.Host, proxyConfig.Port)
+func getProxyIP(proxyConfig *ProxyConfig) (string, error) {
 	dialer, err := proxy.SOCKS5(
 		"tcp",
 		fmt.Sprintf("%s:%d", proxyConfig.Host, proxyConfig.Port),
-		auth,
-		baseDialer,
+		&proxy.Auth{
+			User:     proxyConfig.Username,
+			Password: proxyConfig.Password,
+		},
+		&net.Dialer{Timeout: 3 * time.Second},
 	)
 	if err != nil {
-		log.Printf("Failed to create SOCKS5 dialer: %v", err)
-		return nil, err
+		return "", err
 	}
 
-	return dialer, nil
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+		},
+		Timeout: 3 * time.Second,
+	}
+
+	resp, err := client.Get("https://api.ipify.org")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	ip, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(ip), nil
+}
+
+func createLogEntry(req EmailRequest, r *http.Request) map[string]interface{} {
+	clientIP := r.RemoteAddr
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		clientIP = forwarded
+	}
+
+	return map[string]interface{}{
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"originalIp": func() string {
+			if req.OriginalIP != "" {
+				return req.OriginalIP
+			}
+			return clientIP
+		}(),
+		"beforeProxyIp": clientIP,
+		"requestData": map[string]string{
+			"toEmail":     req.ToEmail,
+			"senderEmail": req.SenderEmail,
+			"subject":     req.Subject,
+		},
+		"proxyConfig": func() interface{} {
+			if req.ProxyConfig != nil {
+				return map[string]interface{}{
+					"host":    req.ProxyConfig.Host,
+					"port":    req.ProxyConfig.Port,
+					"hasAuth": req.ProxyConfig.Username != "",
+				}
+			}
+			return nil
+		}(),
+	}
 }
 
 func generateUUID() string {
