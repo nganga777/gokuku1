@@ -120,11 +120,11 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		logEntry["connectionType"] = "proxy"
 		log.Println("Proxy configured, will attempt to use for SMTP")
 		
-		// Get the proxy IP if possible
-		if ip, err := getPublicIPViaProxy(req.ProxyConfig); err == nil {
+		// Try to get proxy IP (but don't fail if we can't)
+		if ip, err := getProxyIP(req.ProxyConfig); err == nil {
 			afterProxyIP = ip
 			logEntry["afterProxyIp"] = afterProxyIP
-			log.Printf("Proxy IP detected: %s", afterProxyIP)
+			log.Printf("Detected proxy IP: %s", afterProxyIP)
 		} else {
 			log.Printf("Could not detect proxy IP: %v", err)
 		}
@@ -166,10 +166,10 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func getPublicIPViaProxy(proxyConfig *ProxyConfig) (string, error) {
+func getProxyIP(proxyConfig *ProxyConfig) (string, error) {
 	dialer, err := createProxyDialer(proxyConfig)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create proxy dialer: %v", err)
 	}
 
 	transport := &http.Transport{
@@ -180,12 +180,12 @@ func getPublicIPViaProxy(proxyConfig *ProxyConfig) (string, error) {
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   10 * time.Second,
+		Timeout:   5 * time.Second,
 	}
 
 	resp, err := client.Get("https://api.ipify.org")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get IP: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -193,12 +193,12 @@ func getPublicIPViaProxy(proxyConfig *ProxyConfig) (string, error) {
 		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	ip, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read response: %v", err)
 	}
 
-	return string(body), nil
+	return string(ip), nil
 }
 
 func createLogEntry(req EmailRequest, r *http.Request) map[string]interface{} {
