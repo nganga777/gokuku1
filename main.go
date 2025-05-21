@@ -76,6 +76,11 @@ var (
 	}
 )
 
+const (
+	maxRetries      = 3
+	initialRetryDelay = 1 * time.Second
+)
+
 func main() {
 	r := mux.NewRouter()
 	r.HandleFunc("/send-email", sendEmailHandler).Methods("POST")
@@ -144,8 +149,8 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Isolated email sending
-	err := sendEmailWithIsolation(req, logEntry, proxyUsed)
+	// Isolated email sending with retries
+	err := sendEmailWithRetry(req, logEntry, proxyUsed)
 	if err != nil {
 		log.Printf("Email sending failed: %v", err)
 		response := EmailResponse{
@@ -166,6 +171,27 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func sendEmailWithRetry(req EmailRequest, logs map[string]interface{}, useProxy bool) error {
+	var lastErr error
+	
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("Attempt %d/%d to send email", attempt, maxRetries)
+		err := sendEmailWithIsolation(req, logs, useProxy)
+		if err == nil {
+			return nil
+		}
+		
+		lastErr = err
+		if attempt < maxRetries {
+			retryDelay := time.Duration(attempt) * initialRetryDelay
+			log.Printf("Attempt %d failed, retrying in %v: %v", attempt, retryDelay, err)
+			time.Sleep(retryDelay)
+		}
+	}
+	
+	return fmt.Errorf("after %d attempts, last error: %v", maxRetries, lastErr)
 }
 
 func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, useProxy bool) error {
