@@ -61,8 +61,8 @@ var (
 	connectionPool = sync.Pool{
 		New: func() interface{} {
 			return &net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 0, // Disable keep-alive
+				Timeout:   15 * time.Second,
+				KeepAlive: 0,
 			}
 		},
 	}
@@ -77,8 +77,11 @@ var (
 )
 
 const (
-	maxRetries      = 3
-	initialRetryDelay = 1 * time.Second
+	maxRetries        = 3
+	initialRetryDelay = 2 * time.Second
+	smtpDialTimeout   = 15 * time.Second
+	smtpCmdTimeout   = 10 * time.Second
+	smtpDataTimeout  = 15 * time.Second
 )
 
 func main() {
@@ -89,8 +92,8 @@ func main() {
 	srv := &http.Server{
 		Handler:      r,
 		Addr:         ":3000",
-		WriteTimeout: 30 * time.Second,
-		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 45 * time.Second,
+		ReadTimeout:  45 * time.Second,
 	}
 
 	log.Println("Server started on :3000")
@@ -135,7 +138,6 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	messageID := fmt.Sprintf("<%s@%s>", generateUUID(), req.SMTPConfig.Host)
 	logEntry["messageId"] = messageID
 
-	// Non-blocking proxy IP detection
 	proxyUsed := req.ProxyConfig != nil && req.ProxyConfig.Host != ""
 	if proxyUsed {
 		logEntry["proxyUsed"] = true
@@ -149,7 +151,6 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Isolated email sending with retries
 	err := sendEmailWithRetry(req, logEntry, proxyUsed)
 	if err != nil {
 		log.Printf("Email sending failed: %v", err)
@@ -197,7 +198,6 @@ func sendEmailWithRetry(req EmailRequest, logs map[string]interface{}, useProxy 
 func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, useProxy bool) error {
 	log.Println("Starting isolated email sending process")
 	
-	// Get a dialer from the pool
 	baseDialer := connectionPool.Get().(*net.Dialer)
 	defer connectionPool.Put(baseDialer)
 
@@ -215,15 +215,7 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 
 		var err error
 		if proxyDialerWrapper.dialer == nil {
-			proxyDialerWrapper.dialer, err = proxy.SOCKS5(
-				"tcp",
-				fmt.Sprintf("%s:%d", req.ProxyConfig.Host, req.ProxyConfig.Port),
-				&proxy.Auth{
-					User:     req.ProxyConfig.Username,
-					Password: req.ProxyConfig.Password,
-				},
-				baseDialer,
-			)
+			proxyDialerWrapper.dialer, err = createProxyDialer(req.ProxyConfig)
 		}
 		if err != nil {
 			return fmt.Errorf("proxy connection failed: %v", err)
@@ -234,14 +226,17 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 	addr := fmt.Sprintf("%s:%d", req.SMTPConfig.Host, req.SMTPConfig.Port)
 	auth := smtp.PlainAuth("", req.SMTPConfig.Auth.User, req.SMTPConfig.Auth.Password, req.SMTPConfig.Host)
 
-	// Create isolated connection
-	conn, err := dialer.Dial("tcp", addr)
+	ctx, cancel := context.WithTimeout(context.Background(), smtpDialTimeout)
+	defer cancel()
+
+	conn, err := dialer.(interface {
+		DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+	}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to dial SMTP server: %v", err)
 	}
 	defer conn.Close()
 
-	// Create new client for each request
 	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
 	if err != nil {
 		return fmt.Errorf("failed to create SMTP client: %v", err)
@@ -252,6 +247,9 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		}
 	}()
 
+	if err := clientSetDeadline(client, smtpCmdTimeout); err != nil {
+		return err
+	}
 	if err := client.Hello("localhost"); err != nil {
 		return fmt.Errorf("initial EHLO failed: %v", err)
 	}
@@ -269,10 +267,16 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		}
 	}
 
+	if err := clientSetDeadline(client, smtpCmdTimeout); err != nil {
+		return err
+	}
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("SMTP authentication failed: %v", err)
 	}
 
+	if err := clientSetDeadline(client, smtpCmdTimeout); err != nil {
+		return err
+	}
 	from := mail.Address{Name: req.SenderName, Address: req.SenderEmail}
 	to := mail.Address{Address: req.ToEmail}
 	if err := client.Mail(from.Address); err != nil {
@@ -282,6 +286,9 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		return fmt.Errorf("RCPT TO failed: %v", err)
 	}
 
+	if err := clientSetDeadline(client, smtpDataTimeout); err != nil {
+		return err
+	}
 	wc, err := client.Data()
 	if err != nil {
 		return fmt.Errorf("DATA command failed: %v", err)
@@ -304,16 +311,27 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 	return nil
 }
 
-func getProxyIP(proxyConfig *ProxyConfig) (string, error) {
-	dialer, err := proxy.SOCKS5(
+func clientSetDeadline(client *smtp.Client, timeout time.Duration) error {
+	return client.SetDeadline(time.Now().Add(timeout))
+}
+
+func createProxyDialer(proxyConfig *ProxyConfig) (proxy.Dialer, error) {
+	return proxy.SOCKS5(
 		"tcp",
 		fmt.Sprintf("%s:%d", proxyConfig.Host, proxyConfig.Port),
 		&proxy.Auth{
 			User:     proxyConfig.Username,
 			Password: proxyConfig.Password,
 		},
-		&net.Dialer{Timeout: 3 * time.Second},
+		&net.Dialer{
+			Timeout:   smtpDialTimeout,
+			KeepAlive: 0,
+		},
 	)
+}
+
+func getProxyIP(proxyConfig *ProxyConfig) (string, error) {
+	dialer, err := createProxyDialer(proxyConfig)
 	if err != nil {
 		return "", err
 	}
