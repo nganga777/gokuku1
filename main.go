@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/smtp"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,6 +75,7 @@ var (
 			}{}
 		},
 	}
+	smtpClientMutex sync.Mutex
 )
 
 const (
@@ -82,7 +84,10 @@ const (
 	smtpDialTimeout   = 15 * time.Second
 	smtpCmdTimeout    = 10 * time.Second
 	smtpDataTimeout   = 15 * time.Second
+	maxConcurrent     = 10 // Limit concurrent SMTP connections
 )
+
+var semaphore = make(chan struct{}, maxConcurrent)
 
 func main() {
 	r := mux.NewRouter()
@@ -150,6 +155,10 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 	}
+
+	// Acquire semaphore to limit concurrent SMTP connections
+	semaphore <- struct{}{}
+	defer func() { <-semaphore }()
 
 	err := sendEmailWithRetry(req, logEntry, proxyUsed)
 	if err != nil {
@@ -226,6 +235,7 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 	addr := fmt.Sprintf("%s:%d", req.SMTPConfig.Host, req.SMTPConfig.Port)
 	auth := smtp.PlainAuth("", req.SMTPConfig.Auth.User, req.SMTPConfig.Auth.Password, req.SMTPConfig.Host)
 
+	// Create fresh connection with timeout
 	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to dial SMTP server: %v", err)
@@ -237,8 +247,12 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		return fmt.Errorf("failed to set connection deadline: %v", err)
 	}
 
+	// Create new client with fresh connection
 	client, err := smtp.NewClient(conn, req.SMTPConfig.Host)
 	if err != nil {
+		if isSMTPProtocolError(err) {
+			return fmt.Errorf("SMTP protocol error: %v", err)
+		}
 		return fmt.Errorf("failed to create SMTP client: %v", err)
 	}
 	defer func() {
@@ -255,6 +269,7 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 		return fmt.Errorf("initial EHLO failed: %v", err)
 	}
 
+	// Handle STARTTLS if needed
 	if req.SMTPConfig.Port == 587 {
 		if ok, _ := client.Extension("STARTTLS"); ok {
 			tlsConfig := &tls.Config{
@@ -313,6 +328,17 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 
 	log.Println("Email successfully sent")
 	return nil
+}
+
+func isSMTPProtocolError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "short response") ||
+		strings.Contains(errStr, "unexpected response") ||
+		strings.Contains(errStr, "malformed response") ||
+		strings.Contains(errStr, "protocol error")
 }
 
 func createProxyDialer(proxyConfig *ProxyConfig) (proxy.Dialer, error) {
