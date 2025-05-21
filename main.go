@@ -311,7 +311,6 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 		var err error
 		dialer, err = createProxyDialer(req.ProxyConfig)
 		if err != nil {
-			log.Printf("Failed to create proxy dialer for SMTP: %v", err)
 			return fmt.Errorf("proxy connection failed: %v", err)
 		}
 	}
@@ -338,10 +337,11 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 		return fmt.Errorf("EHLO failed: %v", err)
 	}
 
-	// Handle STARTTLS for port 587
+	// Special handling for port 587
 	if req.SMTPConfig.Port == 587 {
+		log.Println("Port 587 detected - checking for STARTTLS support")
 		if ok, _ := client.Extension("STARTTLS"); ok {
-			log.Println("Starting STARTTLS")
+			log.Println("Server supports STARTTLS, attempting upgrade")
 			tlsConfig := &tls.Config{
 				ServerName:         req.SMTPConfig.Host,
 				InsecureSkipVerify: false,
@@ -350,10 +350,14 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 			if err := client.StartTLS(tlsConfig); err != nil {
 				return fmt.Errorf("STARTTLS failed: %v", err)
 			}
+			log.Println("STARTTLS completed successfully")
+			
 			// Re-send EHLO after STARTTLS
 			if err := client.Hello("localhost"); err != nil {
 				return fmt.Errorf("EHLO after STARTTLS failed: %v", err)
 			}
+		} else {
+			log.Println("Server does not support STARTTLS, continuing without encryption")
 		}
 	}
 
@@ -391,6 +395,7 @@ func sendEmail(req EmailRequest, logs map[string]interface{}, useProxy bool) err
 		return fmt.Errorf("failed to write email body: %v", err)
 	}
 
+	log.Println("Email successfully sent")
 	return nil
 }
 
