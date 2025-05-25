@@ -79,7 +79,7 @@ var (
 )
 
 const (
-	maxRetries        = 3
+	maxRetries        = 10
 	initialRetryDelay = 2 * time.Second
 	smtpDialTimeout   = 15 * time.Second
 	smtpCmdTimeout    = 10 * time.Second
