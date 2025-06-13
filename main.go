@@ -320,7 +320,16 @@ func sendEmailWithIsolation(req EmailRequest, logs map[string]interface{}, usePr
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", req.Subject))
 	msg.WriteString("Content-Type: text/html\r\n")
 	msg.WriteString("\r\n")
-	msg.WriteString(fmt.Sprintf("<p>Your verification code is: <strong>%s</strong></p>", req.Code))
+	msg.WriteString(fmt.Sprintf(`
+	<p>Hi,</p>
+	<p>We received your request for a single-use code to use with your ID.me account .</p>
+	<p>Your single-use code is: <strong>%s</strong></p>
+	<p>Only enter this code on an official website or app. Don't share it with anyone. We'll never ask for it outside an official platform.</p>
+	<p>Thanks,<br>
+	The ID.me account team<br>
+	Privacy Statement: <a href="https://www.id.me/privacy">https://www.id.me/privacy</a><br>
+	ID.me, Inc., 8280 Greensboro Drive, Suite 800 McLean, VA, 22102, US.</p>
+	`, req.Code))
 
 	if _, err := msg.WriteTo(wc); err != nil {
 		return fmt.Errorf("failed to write email body: %v", err)
